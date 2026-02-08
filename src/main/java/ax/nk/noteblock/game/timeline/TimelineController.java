@@ -49,7 +49,9 @@ import java.util.*;
 public final class TimelineController implements GameController, Listener {
 
     // Track geometry: X = time, Z = pitch row
-    private static final int TRACK_TIME_LENGTH = 100;
+    private static final int DEFAULT_TRACK_TIME_LENGTH = 100;
+    private static final int MAX_TRACK_TIME_LENGTH = 1000;
+    private static final int MIN_TRACK_TIME_LENGTH = 1;
     private static final int TRACK_PITCH_WIDTH = 25;
 
     // World coords (relative to world spawn); keep it simple and consistent
@@ -64,15 +66,12 @@ public final class TimelineController implements GameController, Listener {
     private static final String TYPE_START = "start";
     private static final String TYPE_SETTINGS = "settings";
     private static final String TYPE_LAYER_TOOL = "layer_tool";
+    private static final String TYPE_RANGE_TOOL = "range_tool";
 
     private static final int INVENTORY_SLOT_START = 8;
     private static final int INVENTORY_SLOT_SETTINGS = 7;
     private static final int INVENTORY_SLOT_LAYER_TOOL = 6;
-
-    private static final int SETTINGS_TEMPO_SLOT = 11;
-    private static final int SETTINGS_TEMPO_MINUS_SLOT = 20;
-    private static final int SETTINGS_TEMPO_PLUS_SLOT = 24;
-    private static final int SETTINGS_CLOSE_SLOT = 31;
+    private static final int INVENTORY_SLOT_RANGE_TOOL = 5;
 
     private static final int MIN_TICKS_PER_STEP = 1;
     private static final int MAX_TICKS_PER_STEP = 20;
@@ -82,13 +81,12 @@ public final class TimelineController implements GameController, Listener {
     // tempo is in server ticks per step
     private int ticksPerStep = (int) TICKS_PER_STEP;
 
-    private final Plugin plugin;
+    // Track length (X axis)
+    private int trackLength = DEFAULT_TRACK_TIME_LENGTH;
 
-    private NamespacedKey keyType;
-    private NamespacedKey keyInstrument;
-
-    private GameSession session;
-    private Player player;
+    // Playback range selection (inclusive indices, null = unset)
+    private Integer rangeBeginIndex;
+    private Integer rangeEndIndex;
 
     // restore state when the session ends
     private boolean previousAllowFlight;
@@ -109,13 +107,21 @@ public final class TimelineController implements GameController, Listener {
     // playhead overlay
     private final Map<BlockPos, Material> playheadOverlay = new HashMap<>();
 
-    private Inventory settingsInventory;
+    // range overlay
+    private final Map<BlockPos, Material> rangeOverlay = new HashMap<>();
+
+    private Inventory settingsMainInventory;
+    private Inventory settingsTempoInventory;
+    private Inventory settingsLengthInventory;
 
     private static final String MENU_SETTINGS_MAIN_TITLE = "Settings";
     private static final String MENU_SETTINGS_TEMPO_TITLE = "Settings > Tempo";
+    private static final String MENU_SETTINGS_LENGTH_TITLE = "Settings > Track Length";
 
     private static final int MAIN_TEMPO_BUTTON_SLOT = 13;
+    private static final int MAIN_LENGTH_BUTTON_SLOT = 15;
     private static final int MAIN_CLOSE_SLOT = 31;
+    private static final int MAIN_LOOP_BUTTON_SLOT = 11;
 
     private static final int TEMPO_DISPLAY_SLOT = 13;
     private static final int TEMPO_MINUS_SLOT = 20;
@@ -123,8 +129,15 @@ public final class TimelineController implements GameController, Listener {
     private static final int TEMPO_BACK_SLOT = 30;
     private static final int TEMPO_CLOSE_SLOT = 32;
 
-    private Inventory settingsMainInventory;
-    private Inventory settingsTempoInventory;
+    private static final int LENGTH_DISPLAY_SLOT = 13;
+    private static final int LENGTH_PLUS_1_SLOT = 19;
+    private static final int LENGTH_PLUS_10_SLOT = 20;
+    private static final int LENGTH_PLUS_50_SLOT = 21;
+    private static final int LENGTH_MINUS_1_SLOT = 25;
+    private static final int LENGTH_MINUS_10_SLOT = 24;
+    private static final int LENGTH_MINUS_50_SLOT = 23;
+    private static final int LENGTH_BACK_SLOT = 30;
+    private static final int LENGTH_CLOSE_SLOT = 32;
 
     private static final boolean DEBUG_INPUT = false;
     private long lastRightClickMs;
@@ -134,6 +147,16 @@ public final class TimelineController implements GameController, Listener {
     private static int layerY(int layerIndex) {
         return TRACK_Y + layerIndex;
     }
+
+    private final Plugin plugin;
+
+    private NamespacedKey keyType;
+    private NamespacedKey keyInstrument;
+
+    private GameSession session;
+    private Player player;
+
+    private boolean loopEnabled = false;
 
     public TimelineController(Plugin plugin) {
         this.plugin = plugin;
@@ -151,6 +174,7 @@ public final class TimelineController implements GameController, Listener {
 
         applyWorldRules(session.world());
         applySafeFlight(player);
+        startFreezeTimeTask(session.world());
         buildTrack(session.world());
         giveItems(player);
 
@@ -163,14 +187,20 @@ public final class TimelineController implements GameController, Listener {
 
         // Reset controller state for a clean session.
         ticksPerStep = (int) TICKS_PER_STEP;
-        settingsInventory = null;
+        trackLength = DEFAULT_TRACK_TIME_LENGTH;
+        rangeBeginIndex = null;
+        rangeEndIndex = null;
         settingsMainInventory = null;
         settingsTempoInventory = null;
+        settingsLengthInventory = null;
         playheadOverlay.clear();
+        rangeOverlay.clear();
         layerCount = 1;
         activeLayerIndex = 0;
+        loopEnabled = false;
+
         scoreByLayer.clear();
-        for (int i = 0; i < LAYER_COUNT; i++) scoreByLayer.add(new HashMap<>());
+        ensureScoreInitialized();
         refByPos.clear();
     }
 
@@ -178,12 +208,14 @@ public final class TimelineController implements GameController, Listener {
     public void onStop(GameSession session) {
         stopPlayback();
         clearPlayhead();
+        clearRangeOverlay();
         if (player != null) {
             restoreFlight(player);
         }
         HandlerList.unregisterAll(this);
         for (Map<Integer, List<NoteEvent>> m : scoreByLayer) m.clear();
         refByPos.clear();
+        stopFreezeTimeTask();
     }
 
     // --- Events
@@ -223,9 +255,9 @@ public final class TimelineController implements GameController, Listener {
         event.setCancelled(true);
         event.getPlayer().getInventory().setItem(event.getHand(), normalizeTokenStack(inHand));
 
-        upsertNote(target.getLocation(), instrumentId, cell.pitch, activeLayerIndex);
+        upsertNote(target.getLocation(), instrumentId, cell.pitch(), activeLayerIndex);
         // Preview the note on placement.
-        previewNote(instrumentId, cell.pitch);
+        previewNote(instrumentId, cell.pitch());
     }
 
     @EventHandler(priority = EventPriority.HIGHEST)
@@ -238,7 +270,7 @@ public final class TimelineController implements GameController, Listener {
         final NoteEvent removed = removeNoteAt(block);
         if (removed != null) {
             event.setCancelled(true);
-            previewNote(removed.instrumentId, removed.pitch);
+            previewNote(removed.instrumentId(), removed.pitch());
         }
     }
 
@@ -259,6 +291,11 @@ public final class TimelineController implements GameController, Listener {
             handleSettingsTempoClick(event.getRawSlot());
             return;
         }
+        if (isSettingsLengthView(event.getView())) {
+            event.setCancelled(true);
+            handleSettingsLengthClick(event.getRawSlot());
+            return;
+        }
 
         // Otherwise allow moving instruments freely.
         // We still prevent a couple of abusive actions with the control items.
@@ -272,7 +309,6 @@ public final class TimelineController implements GameController, Listener {
         if (event.getClick() == ClickType.DROP
                 || event.getClick() == ClickType.CONTROL_DROP
                 || event.getAction() == InventoryAction.HOTBAR_SWAP
-                || event.getAction() == InventoryAction.HOTBAR_MOVE_AND_READD
                 || event.getAction() == InventoryAction.CLONE_STACK) {
             event.setCancelled(true);
         }
@@ -290,15 +326,44 @@ public final class TimelineController implements GameController, Listener {
 
         final Action action = event.getAction();
 
+        // Sword range tool: Shift+Click resets; Left sets BEGIN; Right sets END
+        final ItemStack item = event.getItem();
+        if (isRangeTool(item)
+                && (action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK
+                || action == Action.RIGHT_CLICK_AIR || action == Action.RIGHT_CLICK_BLOCK)) {
+            event.setCancelled(true);
+
+            if (event.getPlayer().isSneaking()) {
+                resetRange();
+                player.sendActionBar(ChatColor.GRAY + "Range cleared");
+                player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, SoundCategory.MASTER, 0.4f, 0.9f);
+                return;
+            }
+
+            final Integer idx = raycastTimeIndex();
+            if (idx == null) {
+                player.sendActionBar(ChatColor.RED + "Look at the track to set a range.");
+                return;
+            }
+
+            if (action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK) {
+                setRangeBegin(idx);
+                player.sendActionBar(ChatColor.AQUA + "Begin: " + ChatColor.WHITE + idx);
+            } else {
+                setRangeEnd(idx);
+                player.sendActionBar(ChatColor.GOLD + "End: " + ChatColor.WHITE + idx);
+            }
+            player.playSound(player.getLocation(), Sound.UI_BUTTON_CLICK, SoundCategory.MASTER, 0.4f, 1.2f);
+            return;
+        }
+
         // Left click: long-distance remove note on track.
         if (action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK) {
             final Block target = raycastTrackCellBlock();
             if (target != null) {
-                // Assist: remove note from active layer first if present, otherwise remove whatever is there.
-                final BlockPos pos = BlockPos.from(target.getLocation());
                 final NoteEvent removed = removeNoteAt(target);
                 if (removed != null) {
-                    previewNote(removed.instrumentId, removed.pitch);
+                    previewNote(removed.instrumentId(), removed.pitch());
                     event.setCancelled(true);
                 }
             }
@@ -308,15 +373,13 @@ public final class TimelineController implements GameController, Listener {
         // Right click: we handle BOTH AIR and BLOCK.
         if (action != Action.RIGHT_CLICK_AIR && action != Action.RIGHT_CLICK_BLOCK) return;
 
-        // Basic debounce (some clients send duplicates)
+        // Basic debounce
         final long now = System.currentTimeMillis();
         if (now - lastRightClickMs < 75) {
             event.setCancelled(true);
             return;
         }
         lastRightClickMs = now;
-
-        final ItemStack item = event.getItem();
 
         // Always cancel for our special items so region plugins/vanilla don't eat it.
         if (isSettingsItem(item)) {
@@ -365,8 +428,8 @@ public final class TimelineController implements GameController, Listener {
                     event.setCancelled(true);
                     final Material marker = InstrumentPalette.byId(instrumentId).marker;
                     target.setType(marker, false);
-                    upsertNote(target.getLocation(), instrumentId, cell.pitch, activeLayerIndex);
-                    previewNote(instrumentId, cell.pitch);
+                    upsertNote(target.getLocation(), instrumentId, cell.pitch(), activeLayerIndex);
+                    previewNote(instrumentId, cell.pitch());
                     event.getPlayer().getInventory().setItemInMainHand(normalizeTokenStack(item));
                 }
             }
@@ -412,7 +475,6 @@ public final class TimelineController implements GameController, Listener {
 
     private void startPlayback() {
         stopPlayback();
-        playhead = 0;
 
         playbackTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             if (player == null || !player.isOnline()) {
@@ -424,12 +486,30 @@ public final class TimelineController implements GameController, Listener {
                 return;
             }
 
+            // Recompute bounds dynamically so changing RANGE mid-playback affects the next loop.
+            final int startIndex = playbackStartIndex();
+            final int endExclusive = playbackEndExclusive();
+            if (startIndex >= endExclusive) {
+                stopPlayback();
+                player.sendMessage(ChatColor.RED + "Invalid range.");
+                return;
+            }
+
+            if (playhead < startIndex || playhead >= endExclusive) {
+                playhead = startIndex;
+            }
+
             drawPlayhead(playhead);
             playStep(playhead);
             playhead++;
-            if (playhead >= TRACK_TIME_LENGTH) {
-                stopPlayback();
-                player.sendMessage(ChatColor.GRAY + "Playback finished.");
+
+            if (playhead >= endExclusive) {
+                if (loopEnabled) {
+                    playhead = startIndex;
+                } else {
+                    stopPlayback();
+                    player.sendMessage(ChatColor.GRAY + "Playback finished.");
+                }
             }
         }, 0L, ticksPerStep);
     }
@@ -440,6 +520,33 @@ public final class TimelineController implements GameController, Listener {
             playbackTask = null;
         }
         clearPlayhead();
+
+        // Reset playhead so the next start always begins from the start (or range start).
+        playhead = playbackStartIndex();
+    }
+
+    private int playbackStartIndex() {
+        final int min = 0;
+        final int max = trackLength; // exclusive
+        if (rangeBeginIndex == null && rangeEndIndex == null) return min;
+
+        int a = rangeBeginIndex == null ? min : clamp(rangeBeginIndex, min, max - 1);
+        int b = rangeEndIndex == null ? (max - 1) : clamp(rangeEndIndex, min, max - 1);
+        return Math.min(a, b);
+    }
+
+    private int playbackEndExclusive() {
+        final int min = 0;
+        final int max = trackLength; // exclusive
+        if (rangeBeginIndex == null && rangeEndIndex == null) return max;
+
+        int a = rangeBeginIndex == null ? min : clamp(rangeBeginIndex, min, max - 1);
+        int b = rangeEndIndex == null ? (max - 1) : clamp(rangeEndIndex, min, max - 1);
+        return Math.max(a, b) + 1;
+    }
+
+    private static int clamp(int v, int minInclusive, int maxInclusive) {
+        return Math.max(minInclusive, Math.min(maxInclusive, v));
     }
 
     private void drawPlayhead(int tickIndex) {
@@ -481,18 +588,22 @@ public final class TimelineController implements GameController, Listener {
     }
 
     private void upsertNote(Location loc, int instrumentId, int pitch, int layerIndex) {
+        ensureScoreInitialized();
+        layerIndex = clampLayerIndex(layerIndex);
+
         final TrackCell cell = toCell(loc);
         if (cell == null) return;
 
-        final int tickIndex = cell.timeIndex;
+        final int tickIndex = cell.timeIndex();
         final BlockPos pos = BlockPos.from(loc);
 
         final NoteRef old = refByPos.put(pos, new NoteRef(layerIndex, tickIndex));
         if (old != null) {
-            final List<NoteEvent> oldList = scoreByLayer.get(old.layerIndex).get(old.tickIndex);
+            final int oldLayer = clampLayerIndex(old.layerIndex());
+            final List<NoteEvent> oldList = scoreByLayer.get(oldLayer).get(old.tickIndex());
             if (oldList != null) {
-                oldList.removeIf(n -> n.pos.equals(pos));
-                if (oldList.isEmpty()) scoreByLayer.get(old.layerIndex).remove(old.tickIndex);
+                oldList.removeIf(n -> n.pos().equals(pos));
+                if (oldList.isEmpty()) scoreByLayer.get(oldLayer).remove(old.tickIndex());
             }
         }
 
@@ -502,23 +613,27 @@ public final class TimelineController implements GameController, Listener {
     }
 
     private NoteEvent removeNoteAt(Block block) {
+        ensureScoreInitialized();
+
         final BlockPos pos = BlockPos.from(block.getLocation());
         final NoteRef ref = refByPos.remove(pos);
         if (ref == null) return null;
 
+        final int refLayer = clampLayerIndex(ref.layerIndex());
+
         NoteEvent removed = null;
-        final Map<Integer, List<NoteEvent>> layerScore = scoreByLayer.get(ref.layerIndex);
-        final List<NoteEvent> list = layerScore.get(ref.tickIndex);
+        final Map<Integer, List<NoteEvent>> layerScore = scoreByLayer.get(refLayer);
+        final List<NoteEvent> list = layerScore.get(ref.tickIndex());
         if (list != null) {
             for (Iterator<NoteEvent> it = list.iterator(); it.hasNext(); ) {
                 final NoteEvent n = it.next();
-                if (n.pos.equals(pos)) {
+                if (n.pos().equals(pos)) {
                     removed = n;
                     it.remove();
                     break;
                 }
             }
-            if (list.isEmpty()) layerScore.remove(ref.tickIndex);
+            if (list.isEmpty()) layerScore.remove(ref.tickIndex());
         }
 
         final World w = block.getWorld();
@@ -531,94 +646,22 @@ public final class TimelineController implements GameController, Listener {
         return removed;
     }
 
-    private Block raycastTrackCellBlock() {
-        if (player == null) return null;
-        final World w = player.getWorld();
-        if (!isInSessionWorld(w)) return null;
-
-        // Use Bukkit's precise ray trace to get the actual hit block (not just the first block in the track footprint).
-        final RayTraceResult rr = player.rayTraceBlocks(EDIT_RAY_DISTANCE, FluidCollisionMode.NEVER);
-        if (rr == null) return null;
-
-        Block hit = rr.getHitBlock();
-        if (hit == null) return null;
-
-        // When you target the SIDE of a block, we want the adjacent placement block.
-        final BlockFace face = rr.getHitBlockFace();
-        if (face != null) {
-            hit = hit.getRelative(face);
-        }
-
-        final int x = hit.getX();
-        final int z = hit.getZ();
-
-        // Ensure (x,z) is inside the track footprint.
-        final int dx = x - ORIGIN.getBlockX();
-        final int dz = z - ORIGIN.getBlockZ();
-        if (dx < 0 || dx >= TRACK_TIME_LENGTH) return null;
-        if (dz < 0 || dz >= TRACK_PITCH_WIDTH) return null;
-
-        // Snap to active layer at that column.
-        return w.getBlockAt(x, layerY(activeLayerIndex), z);
-    }
-
-    private void buildTrack(World world) {
-        // Build BASE_Y floor once, and clear all layers above.
-        for (int dx = 0; dx < TRACK_TIME_LENGTH; dx++) {
-            for (int dz = 0; dz < TRACK_PITCH_WIDTH; dz++) {
-                final int x = ORIGIN.getBlockX() + dx;
-                final int z = ORIGIN.getBlockZ() + dz;
-
-                final Material floor = (dz & 1) == 0 ? Material.BROWN_CONCRETE : Material.TERRACOTTA;
-                world.getBlockAt(x, BASE_Y, z).setType(floor, false);
-
-                for (int layer = 0; layer < LAYER_COUNT; layer++) {
-                    world.getBlockAt(x, layerY(layer), z).setType(Material.AIR, false);
-                }
-
-                if (dx == 0 || dz == 0 || dx == TRACK_TIME_LENGTH - 1 || dz == TRACK_PITCH_WIDTH - 1) {
-                    world.getBlockAt(x, BASE_Y, z).setType(Material.BLACK_CONCRETE, false);
-                }
-            }
-        }
-
-        // Direction indicator
-        final int zArrow = ORIGIN.getBlockZ() + TRACK_PITCH_WIDTH;
-        for (int dx = 0; dx < TRACK_TIME_LENGTH; dx++) {
-            world.getBlockAt(ORIGIN.getBlockX() + dx, BASE_Y, zArrow).setType(Material.DARK_OAK_PLANKS, false);
-        }
-        world.getBlockAt(ORIGIN.getBlockX() + TRACK_TIME_LENGTH - 1, BASE_Y, zArrow).setType(Material.GOLD_BLOCK, false);
-        world.getBlockAt(ORIGIN.getBlockX() + TRACK_TIME_LENGTH - 2, BASE_Y, zArrow - 1).setType(Material.GOLD_BLOCK, false);
-        world.getBlockAt(ORIGIN.getBlockX() + TRACK_TIME_LENGTH - 2, BASE_Y, zArrow + 1).setType(Material.GOLD_BLOCK, false);
-
-        // Pitch markers
-        final int zLow = ORIGIN.getBlockZ();
-        final int zHigh = ORIGIN.getBlockZ() + TRACK_PITCH_WIDTH - 1;
-        for (int dx = 0; dx < TRACK_TIME_LENGTH; dx++) {
-            world.getBlockAt(ORIGIN.getBlockX() + dx, BASE_Y, zLow).setType(Material.DEEPSLATE_TILES, false);
-            world.getBlockAt(ORIGIN.getBlockX() + dx, BASE_Y, zHigh).setType(Material.QUARTZ_BLOCK, false);
-        }
-
-        final Location view = new Location(world,
-                ORIGIN.getX() + 1.5,
-                TRACK_Y + 1.0,
-                ORIGIN.getZ() + (TRACK_PITCH_WIDTH / 2.0) + 0.5,
-                -90f,
-                20f);
-        player.teleportAsync(view);
-    }
-
     private void playStep(int tickIndex) {
-        for (int layer = 0; layer < layerCount; layer++) {
-            final List<NoteEvent> events = scoreByLayer.get(layer).get(tickIndex);
+        ensureScoreInitialized();
+        final int layersToPlay = Math.min(layerCount, scoreByLayer.size());
+        for (int layer = 0; layer < layersToPlay; layer++) {
+            final Map<Integer, List<NoteEvent>> layerMap = scoreByLayer.get(layer);
+            if (layerMap == null) continue;
+
+            final List<NoteEvent> events = layerMap.get(tickIndex);
             if (events == null || events.isEmpty()) continue;
 
             for (NoteEvent e : events) {
-                final InstrumentPalette palette = InstrumentPalette.byId(e.instrumentId);
-                final float pitch = pitchFromRow(e.pitch);
+                final InstrumentPalette palette = InstrumentPalette.byId(e.instrumentId());
+                final float pitch = pitchFromRow(e.pitch());
                 player.playSound(player.getLocation(), palette.sound, SoundCategory.RECORDS, 1.0f, pitch);
 
-                final Location at = e.pos.toLocation(session.world()).add(0.5, 0.8, 0.5);
+                final Location at = e.pos().toLocation(session.world()).add(0.5, 0.8, 0.5);
                 session.world().spawnParticle(Particle.NOTE, at, 1, 0, 0, 0, 1);
             }
         }
@@ -677,7 +720,7 @@ public final class TimelineController implements GameController, Listener {
         // Clear any blocks on that plane just in case (should be empty).
         final World w = session.world();
         final int y = layerY(layerIndex);
-        for (int dx = 0; dx < TRACK_TIME_LENGTH; dx++) {
+        for (int dx = 0; dx < trackLength; dx++) {
             for (int dz = 0; dz < TRACK_PITCH_WIDTH; dz++) {
                 w.getBlockAt(ORIGIN.getBlockX() + dx, y, ORIGIN.getBlockZ() + dz).setType(Material.AIR, false);
             }
@@ -697,6 +740,19 @@ public final class TimelineController implements GameController, Listener {
 
         if (activeLayerIndex >= layerCount) activeLayerIndex = layerCount - 1;
         player.sendActionBar(ChatColor.YELLOW + "Layers: " + layerCount + " (active " + (activeLayerIndex + 1) + ")");
+        redrawRangeOverlay();
+    }
+
+    private void ensureScoreInitialized() {
+        if (scoreByLayer.isEmpty()) {
+            for (int i = 0; i < LAYER_COUNT; i++) scoreByLayer.add(new HashMap<>());
+        } else {
+            while (scoreByLayer.size() < LAYER_COUNT) scoreByLayer.add(new HashMap<>());
+        }
+    }
+
+    private static int clampLayerIndex(int idx) {
+        return Math.max(0, Math.min(LAYER_COUNT - 1, idx));
     }
 
     private TrackCell toCell(Location loc) {
@@ -707,10 +763,22 @@ public final class TimelineController implements GameController, Listener {
         final int dx = loc.getBlockX() - ORIGIN.getBlockX();
         final int dz = loc.getBlockZ() - ORIGIN.getBlockZ();
 
-        if (dx < 0 || dx >= TRACK_TIME_LENGTH) return null;
+        if (dx < 0 || dx >= trackLength) return null;
         if (dz < 0 || dz >= TRACK_PITCH_WIDTH) return null;
 
         return new TrackCell(dx, dz);
+    }
+
+    private boolean isLayerTool(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        final PersistentDataContainer pdc = item.getItemMeta().getPersistentDataContainer();
+        return TYPE_LAYER_TOOL.equals(pdc.get(keyType, PersistentDataType.STRING));
+    }
+
+    private boolean isRangeTool(ItemStack item) {
+        if (item == null || !item.hasItemMeta()) return false;
+        final PersistentDataContainer pdc = item.getItemMeta().getPersistentDataContainer();
+        return TYPE_RANGE_TOOL.equals(pdc.get(keyType, PersistentDataType.STRING));
     }
 
     private boolean isStartItem(ItemStack item) {
@@ -723,12 +791,6 @@ public final class TimelineController implements GameController, Listener {
         if (item == null || !item.hasItemMeta()) return false;
         final PersistentDataContainer pdc = item.getItemMeta().getPersistentDataContainer();
         return TYPE_SETTINGS.equals(pdc.get(keyType, PersistentDataType.STRING));
-    }
-
-    private boolean isLayerTool(ItemStack item) {
-        if (item == null || !item.hasItemMeta()) return false;
-        final PersistentDataContainer pdc = item.getItemMeta().getPersistentDataContainer();
-        return TYPE_LAYER_TOOL.equals(pdc.get(keyType, PersistentDataType.STRING));
     }
 
     private Integer getInstrumentId(ItemStack item) {
@@ -780,9 +842,26 @@ public final class TimelineController implements GameController, Listener {
         final ItemStack layerTool = new ItemStack(Material.SLIME_BALL, 1);
         final ItemMeta layerToolMeta = layerTool.getItemMeta();
         layerToolMeta.setDisplayName(ChatColor.YELLOW + "Layers");
+        layerToolMeta.setLore(List.of(
+                ChatColor.GRAY + "Right Click: next layer",
+                ChatColor.GRAY + "Shift + Right Click: add/remove"
+        ));
         layerToolMeta.getPersistentDataContainer().set(keyType, PersistentDataType.STRING, TYPE_LAYER_TOOL);
         layerTool.setItemMeta(layerToolMeta);
         player.getInventory().setItem(INVENTORY_SLOT_LAYER_TOOL, layerTool);
+
+        // Range tool
+        final ItemStack rangeTool = new ItemStack(Material.IRON_SWORD, 1);
+        final ItemMeta rangeToolMeta = rangeTool.getItemMeta();
+        rangeToolMeta.setDisplayName(ChatColor.YELLOW + "Range");
+        rangeToolMeta.setLore(List.of(
+                ChatColor.GRAY + "Left Click: set begin",
+                ChatColor.GRAY + "Right Click: set end",
+                ChatColor.GRAY + "Shift + Click: reset"
+        ));
+        rangeToolMeta.getPersistentDataContainer().set(keyType, PersistentDataType.STRING, TYPE_RANGE_TOOL);
+        rangeTool.setItemMeta(rangeToolMeta);
+        player.getInventory().setItem(INVENTORY_SLOT_RANGE_TOOL, rangeTool);
     }
 
     private void applyWorldRules(World world) {
@@ -792,13 +871,40 @@ public final class TimelineController implements GameController, Listener {
         world.setThundering(false);
         world.setClearWeatherDuration(Integer.MAX_VALUE);
 
-        world.setGameRule(GameRule.DO_DAYLIGHT_CYCLE, false);
-        world.setGameRule(GameRule.DO_WEATHER_CYCLE, false);
-        world.setGameRule(GameRule.DO_MOB_SPAWNING, false);
-        world.setGameRule(GameRule.KEEP_INVENTORY, true);
-        world.setGameRule(GameRule.FALL_DAMAGE, false);
-        world.setGameRule(GameRule.DO_IMMEDIATE_RESPAWN, true);
-        world.setGameRule(GameRule.NATURAL_REGENERATION, false);
+        // Freeze time using string gamerule to avoid deprecated enum constants on Paper 1.21.11+
+        setGameRuleIfPresent(world, "doDaylightCycle", false);
+        // Paper rule that hard-stops time ticking
+        setGameRuleIfPresent(world, "tickTime", false);
+
+        setGameRuleIfPresent(world, "doWeatherCycle", false);
+        setGameRuleIfPresent(world, "doMobSpawning", false);
+        setGameRuleIfPresent(world, "keepInventory", true);
+        setGameRuleIfPresent(world, "fallDamage", false);
+        setGameRuleIfPresent(world, "doImmediateRespawn", true);
+        setGameRuleIfPresent(world, "naturalRegeneration", false);
+    }
+
+    private void startFreezeTimeTask(World world) {
+        stopFreezeTimeTask();
+        freezeTimeTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            if (session == null || session.world() == null) {
+                stopFreezeTimeTask();
+                return;
+            }
+            final World w = session.world();
+            if (!w.equals(world)) return;
+
+            setGameRuleIfPresent(w, "doDaylightCycle", false);
+            setGameRuleIfPresent(w, "tickTime", false);
+            w.setTime(6000);
+        }, 0L, 20L);
+    }
+
+    private void stopFreezeTimeTask() {
+        if (freezeTimeTask != null) {
+            freezeTimeTask.cancel();
+            freezeTimeTask = null;
+        }
     }
 
     // --- Settings menus
@@ -819,6 +925,14 @@ public final class TimelineController implements GameController, Listener {
         player.openInventory(settingsTempoInventory);
     }
 
+    private void openSettingsLengthMenu() {
+        if (settingsLengthInventory == null) {
+            settingsLengthInventory = Bukkit.createInventory(null, 9 * 4, MENU_SETTINGS_LENGTH_TITLE);
+        }
+        redrawSettingsLengthMenu();
+        player.openInventory(settingsLengthInventory);
+    }
+
     private void redrawSettingsMainMenu() {
         settingsMainInventory.clear();
 
@@ -827,6 +941,20 @@ public final class TimelineController implements GameController, Listener {
         tempoMeta.setDisplayName(ChatColor.YELLOW + "Tempo");
         tempo.setItemMeta(tempoMeta);
         settingsMainInventory.setItem(MAIN_TEMPO_BUTTON_SLOT, tempo);
+
+        final ItemStack length = new ItemStack(Material.OAK_SIGN);
+        final ItemMeta lengthMeta = length.getItemMeta();
+        lengthMeta.setDisplayName(ChatColor.YELLOW + "Track Length");
+        lengthMeta.setLore(List.of(ChatColor.GRAY + "Current: " + trackLength));
+        length.setItemMeta(lengthMeta);
+        settingsMainInventory.setItem(MAIN_LENGTH_BUTTON_SLOT, length);
+
+        final ItemStack loop = new ItemStack(loopEnabled ? Material.LIME_DYE : Material.GRAY_DYE);
+        final ItemMeta loopMeta = loop.getItemMeta();
+        loopMeta.setDisplayName(ChatColor.YELLOW + "Loop");
+        loopMeta.setLore(List.of(ChatColor.GRAY + "Click to toggle", ChatColor.GRAY + "Current: " + (loopEnabled ? "ON" : "OFF")));
+        loop.setItemMeta(loopMeta);
+        settingsMainInventory.setItem(MAIN_LOOP_BUTTON_SLOT, loop);
 
         final ItemStack close = new ItemStack(Material.BARRIER);
         final ItemMeta closeMeta = close.getItemMeta();
@@ -873,6 +1001,47 @@ public final class TimelineController implements GameController, Listener {
         fillMenuBackground(settingsTempoInventory);
     }
 
+    private void redrawSettingsLengthMenu() {
+        settingsLengthInventory.clear();
+
+        final ItemStack length = new ItemStack(Material.OAK_SIGN);
+        final ItemMeta lengthMeta = length.getItemMeta();
+        lengthMeta.setDisplayName(ChatColor.YELLOW + "Track Length: " + ChatColor.WHITE + trackLength);
+        lengthMeta.setLore(List.of(ChatColor.GRAY + "Max: " + MAX_TRACK_TIME_LENGTH));
+        length.setItemMeta(lengthMeta);
+        settingsLengthInventory.setItem(LENGTH_DISPLAY_SLOT, length);
+
+        settingsLengthInventory.setItem(LENGTH_PLUS_1_SLOT, namedButton(Material.LIME_STAINED_GLASS_PANE, ChatColor.GREEN + "+1"));
+        settingsLengthInventory.setItem(LENGTH_PLUS_10_SLOT, namedButton(Material.LIME_STAINED_GLASS_PANE, ChatColor.GREEN + "+10"));
+        settingsLengthInventory.setItem(LENGTH_PLUS_50_SLOT, namedButton(Material.LIME_STAINED_GLASS_PANE, ChatColor.GREEN + "+50"));
+
+        settingsLengthInventory.setItem(LENGTH_MINUS_50_SLOT, namedButton(Material.RED_STAINED_GLASS_PANE, ChatColor.RED + "-50"));
+        settingsLengthInventory.setItem(LENGTH_MINUS_10_SLOT, namedButton(Material.RED_STAINED_GLASS_PANE, ChatColor.RED + "-10"));
+        settingsLengthInventory.setItem(LENGTH_MINUS_1_SLOT, namedButton(Material.RED_STAINED_GLASS_PANE, ChatColor.RED + "-1"));
+
+        final ItemStack back = new ItemStack(Material.ARROW);
+        final ItemMeta backMeta = back.getItemMeta();
+        backMeta.setDisplayName(ChatColor.YELLOW + "Back");
+        back.setItemMeta(backMeta);
+        settingsLengthInventory.setItem(LENGTH_BACK_SLOT, back);
+
+        final ItemStack close = new ItemStack(Material.BARRIER);
+        final ItemMeta closeMeta = close.getItemMeta();
+        closeMeta.setDisplayName(ChatColor.GRAY + "Close");
+        close.setItemMeta(closeMeta);
+        settingsLengthInventory.setItem(LENGTH_CLOSE_SLOT, close);
+
+        fillMenuBackground(settingsLengthInventory);
+    }
+
+    private ItemStack namedButton(Material mat, String name) {
+        final ItemStack it = new ItemStack(mat);
+        final ItemMeta m = it.getItemMeta();
+        m.setDisplayName(name);
+        it.setItemMeta(m);
+        return it;
+    }
+
     private void fillMenuBackground(Inventory inv) {
         final ItemStack filler = new ItemStack(Material.BLACK_STAINED_GLASS_PANE);
         final ItemMeta fillerMeta = filler.getItemMeta();
@@ -892,9 +1061,25 @@ public final class TimelineController implements GameController, Listener {
         return settingsTempoInventory != null && view.getTopInventory().equals(settingsTempoInventory);
     }
 
+    private boolean isSettingsLengthView(InventoryView view) {
+        return settingsLengthInventory != null && view.getTopInventory().equals(settingsLengthInventory);
+    }
+
     private void handleSettingsMainClick(int rawSlot) {
         if (rawSlot == MAIN_TEMPO_BUTTON_SLOT) {
             openSettingsTempoMenu();
+        } else if (rawSlot == MAIN_LENGTH_BUTTON_SLOT) {
+            openSettingsLengthMenu();
+        } else if (rawSlot == MAIN_LOOP_BUTTON_SLOT) {
+            loopEnabled = !loopEnabled;
+            player.sendMessage(ChatColor.GRAY + "Loop " + (loopEnabled ? "enabled" : "disabled"));
+
+            // If playback is active, apply immediately.
+            if (playbackTask != null && loopEnabled) {
+                playhead = playbackStartIndex();
+            }
+
+            redrawSettingsMainMenu();
         } else if (rawSlot == MAIN_CLOSE_SLOT) {
             player.closeInventory();
         }
@@ -914,12 +1099,135 @@ public final class TimelineController implements GameController, Listener {
         }
     }
 
+    private void handleSettingsLengthClick(int rawSlot) {
+        if (rawSlot == LENGTH_PLUS_1_SLOT) {
+            adjustTrackLength(1);
+        } else if (rawSlot == LENGTH_PLUS_10_SLOT) {
+            adjustTrackLength(10);
+        } else if (rawSlot == LENGTH_PLUS_50_SLOT) {
+            adjustTrackLength(50);
+        } else if (rawSlot == LENGTH_MINUS_1_SLOT) {
+            adjustTrackLength(-1);
+        } else if (rawSlot == LENGTH_MINUS_10_SLOT) {
+            adjustTrackLength(-10);
+        } else if (rawSlot == LENGTH_MINUS_50_SLOT) {
+            adjustTrackLength(-50);
+        } else if (rawSlot == LENGTH_BACK_SLOT) {
+            openSettingsMainMenu();
+            return;
+        } else if (rawSlot == LENGTH_CLOSE_SLOT) {
+            player.closeInventory();
+            return;
+        }
+
+        redrawSettingsLengthMenu();
+    }
+
     private void setTicksPerStep(int newValue) {
         if (newValue == ticksPerStep) return;
         ticksPerStep = newValue;
         player.sendMessage(ChatColor.GRAY + "Tempo set to " + ticksPerStep + " ticks/step");
         if (playbackTask != null) startPlayback();
     }
+
+    private void adjustTrackLength(int delta) {
+        final int oldLength = trackLength;
+        final int newLength = clamp(trackLength + delta, MIN_TRACK_TIME_LENGTH, MAX_TRACK_TIME_LENGTH);
+        if (newLength == trackLength) {
+            if (delta > 0) {
+                player.sendActionBar(ChatColor.RED + "Max track length is " + MAX_TRACK_TIME_LENGTH);
+            } else {
+                player.sendActionBar(ChatColor.RED + "Min track length is " + MIN_TRACK_TIME_LENGTH);
+            }
+            return;
+        }
+
+        // If shrinking, drop out-of-bounds notes so they can't keep playing.
+        if (newLength < oldLength) {
+            pruneNotesOutsideLength(newLength);
+
+            // Also clear the (now out of track) world columns so nothing remains visually.
+            clearWorldColumnsOutsideLength(newLength, oldLength);
+        }
+
+        trackLength = newLength;
+
+        // Keep range markers inside the track.
+        if (rangeBeginIndex != null && rangeBeginIndex >= trackLength) rangeBeginIndex = trackLength - 1;
+        if (rangeEndIndex != null && rangeEndIndex >= trackLength) rangeEndIndex = trackLength - 1;
+        if (trackLength <= 0) {
+            rangeBeginIndex = null;
+            rangeEndIndex = null;
+        }
+
+        player.sendMessage(ChatColor.GRAY + "Track length set to " + trackLength);
+
+        // Rebuild visuals and redraw existing notes.
+        buildTrack(session.world());
+
+        // Restart playback to respect new bounds.
+        if (playbackTask != null) startPlayback();
+    }
+
+    private void pruneNotesOutsideLength(int newLength) {
+        // Remove tick entries >= newLength in every layer.
+        for (int layer = 0; layer < LAYER_COUNT; layer++) {
+            final Map<Integer, List<NoteEvent>> map = scoreByLayer.get(layer);
+            if (map == null || map.isEmpty()) continue;
+
+            final Iterator<Map.Entry<Integer, List<NoteEvent>>> it = map.entrySet().iterator();
+            while (it.hasNext()) {
+                final Map.Entry<Integer, List<NoteEvent>> e = it.next();
+                if (e.getKey() < newLength) continue;
+
+                final List<NoteEvent> list = e.getValue();
+                if (list != null) {
+                    for (NoteEvent n : list) {
+                        refByPos.remove(n.pos());
+                    }
+                }
+                it.remove();
+            }
+        }
+
+        // Also purge any refByPos that points outside, just in case.
+        refByPos.entrySet().removeIf(e -> {
+            final BlockPos pos = e.getKey();
+            final int dx = pos.x() - ORIGIN.getBlockX();
+            return dx >= newLength;
+        });
+    }
+
+    private void clearWorldColumnsOutsideLength(int startInclusive, int endExclusive) {
+        if (session == null || session.world() == null) return;
+        final World w = session.world();
+
+        for (int dx = startInclusive; dx < endExclusive; dx++) {
+            final int x = ORIGIN.getBlockX() + dx;
+
+            for (int dz = 0; dz < TRACK_PITCH_WIDTH; dz++) {
+                final int z = ORIGIN.getBlockZ() + dz;
+
+                // Clear all note layers.
+                for (int layer = 0; layer < LAYER_COUNT; layer++) {
+                    w.getBlockAt(x, layerY(layer), z).setType(Material.AIR, false);
+                }
+
+                // Optional: clear floor too (helps visually when shrinking).
+                w.getBlockAt(x, BASE_Y, z).setType(Material.AIR, false);
+            }
+
+            // Clear arrow strip column too.
+            final int zArrow = ORIGIN.getBlockZ() + TRACK_PITCH_WIDTH;
+            w.getBlockAt(x, BASE_Y, zArrow).setType(Material.AIR, false);
+        }
+
+        // Any overlays that were outside are now invalid.
+        clearPlayhead();
+        clearRangeOverlay();
+    }
+
+    // --- Records
 
     private record TrackCell(int timeIndex, int pitch) {
     }
@@ -928,5 +1236,194 @@ public final class TimelineController implements GameController, Listener {
     }
 
     private record NoteRef(int layerIndex, int tickIndex) {
+    }
+
+    private Block raycastTrackCellBlock() {
+        if (player == null) return null;
+        final World w = player.getWorld();
+        if (!isInSessionWorld(w)) return null;
+
+        final RayTraceResult rr = player.rayTraceBlocks(EDIT_RAY_DISTANCE, FluidCollisionMode.NEVER);
+        if (rr == null) return null;
+
+        Block hit = rr.getHitBlock();
+        if (hit == null) return null;
+
+        // When you target the side of a block, pick the adjacent block.
+        final BlockFace face = rr.getHitBlockFace();
+        if (face != null) {
+            hit = hit.getRelative(face);
+        }
+
+        final int dx = hit.getX() - ORIGIN.getBlockX();
+        final int dz = hit.getZ() - ORIGIN.getBlockZ();
+        if (dx < 0 || dx >= trackLength) return null;
+        if (dz < 0 || dz >= TRACK_PITCH_WIDTH) return null;
+
+        return w.getBlockAt(hit.getX(), layerY(activeLayerIndex), hit.getZ());
+    }
+
+    private Integer raycastTimeIndex() {
+        final Block b = raycastTrackCellBlock();
+        if (b == null) return null;
+        final int dx = b.getX() - ORIGIN.getBlockX();
+        if (dx < 0 || dx >= trackLength) return null;
+        return dx;
+    }
+
+    private void buildTrack(World world) {
+        // Build BASE_Y floor once, and clear all layers above.
+        for (int dx = 0; dx < trackLength; dx++) {
+            for (int dz = 0; dz < TRACK_PITCH_WIDTH; dz++) {
+                final int x = ORIGIN.getBlockX() + dx;
+                final int z = ORIGIN.getBlockZ() + dz;
+
+                final Material floor = (dz & 1) == 0 ? Material.BROWN_CONCRETE : Material.TERRACOTTA;
+                world.getBlockAt(x, BASE_Y, z).setType(floor, false);
+
+                for (int layer = 0; layer < LAYER_COUNT; layer++) {
+                    world.getBlockAt(x, layerY(layer), z).setType(Material.AIR, false);
+                }
+
+                // Only keep the time borders black; pitch edges remain playable alternating floor.
+                if (dx == 0 || dx == trackLength - 1) {
+                    world.getBlockAt(x, BASE_Y, z).setType(Material.BLACK_CONCRETE, false);
+                }
+            }
+        }
+
+        // Direction indicator strip (no golden arrow head)
+        final int zArrow = ORIGIN.getBlockZ() + TRACK_PITCH_WIDTH;
+        for (int dx = 0; dx < trackLength; dx++) {
+            world.getBlockAt(ORIGIN.getBlockX() + dx, BASE_Y, zArrow).setType(Material.DARK_OAK_PLANKS, false);
+        }
+
+        final Location view = new Location(world,
+                ORIGIN.getX() + 1.5,
+                TRACK_Y + 1.0,
+                ORIGIN.getZ() + (TRACK_PITCH_WIDTH / 2.0) + 0.5,
+                -90f,
+                20f);
+        player.teleportAsync(view);
+
+        redrawRangeOverlay();
+        redrawNotesFromScore();
+    }
+
+    private void redrawNotesFromScore() {
+        if (session == null || session.world() == null) return;
+        ensureScoreInitialized();
+
+        final World w = session.world();
+        for (int layer = 0; layer < LAYER_COUNT; layer++) {
+            final Map<Integer, List<NoteEvent>> map = scoreByLayer.get(layer);
+            if (map == null || map.isEmpty()) continue;
+
+            final int y = layerY(layer);
+            for (Map.Entry<Integer, List<NoteEvent>> e : map.entrySet()) {
+                final int tickIndex = e.getKey();
+                if (tickIndex < 0 || tickIndex >= trackLength) continue;
+
+                final List<NoteEvent> list = e.getValue();
+                if (list == null) continue;
+
+                for (NoteEvent n : list) {
+                    final BlockPos pos = n.pos();
+                    final int dx = pos.x() - ORIGIN.getBlockX();
+                    final int dz = pos.z() - ORIGIN.getBlockZ();
+                    if (dx < 0 || dx >= trackLength) continue;
+                    if (dz < 0 || dz >= TRACK_PITCH_WIDTH) continue;
+
+                    final Material marker = InstrumentPalette.byId(n.instrumentId()).marker;
+                    w.getBlockAt(pos.x(), y, pos.z()).setType(marker, false);
+                }
+            }
+        }
+    }
+
+    private void clearRangeOverlay() {
+        if (session == null || session.world() == null) {
+            rangeOverlay.clear();
+            return;
+        }
+        final World w = session.world();
+        for (Map.Entry<BlockPos, Material> e : rangeOverlay.entrySet()) {
+            final BlockPos pos = e.getKey();
+            final Block b = w.getBlockAt(pos.x(), pos.y(), pos.z());
+            if (b.getType() == Material.BLUE_STAINED_GLASS || b.getType() == Material.ORANGE_STAINED_GLASS) {
+                b.setType(e.getValue(), false);
+            }
+        }
+        rangeOverlay.clear();
+    }
+
+    private void redrawRangeOverlay() {
+        clearRangeOverlay();
+        if (session == null || session.world() == null) return;
+        final World w = session.world();
+
+        if (rangeBeginIndex != null) {
+            drawRangeMarker(w, clamp(rangeBeginIndex, 0, trackLength - 1), Material.BLUE_STAINED_GLASS);
+        }
+        if (rangeEndIndex != null) {
+            drawRangeMarker(w, clamp(rangeEndIndex, 0, trackLength - 1), Material.ORANGE_STAINED_GLASS);
+        }
+    }
+
+    private void drawRangeMarker(World w, int timeIndex, Material mat) {
+        final int x = ORIGIN.getBlockX() + timeIndex;
+        final int y = layerY(activeLayerIndex);
+        for (int dz = 0; dz < TRACK_PITCH_WIDTH; dz++) {
+            final int z = ORIGIN.getBlockZ() + dz;
+            final Block b = w.getBlockAt(x, y, z);
+            if (b.getType() == Material.AIR) {
+                final BlockPos pos = BlockPos.from(b.getLocation());
+                rangeOverlay.put(pos, Material.AIR);
+                b.setType(mat, false);
+            }
+        }
+    }
+
+    private void setRangeBegin(int idx) {
+        rangeBeginIndex = idx;
+        redrawRangeOverlay();
+
+        // If we're looping, make a range change take effect immediately (and therefore next loop too).
+        if (playbackTask != null && loopEnabled) {
+            playhead = playbackStartIndex();
+        }
+    }
+
+    private void setRangeEnd(int idx) {
+        rangeEndIndex = idx;
+        redrawRangeOverlay();
+
+        if (playbackTask != null && loopEnabled) {
+            playhead = playbackStartIndex();
+        }
+    }
+
+    private void resetRange() {
+        rangeBeginIndex = null;
+        rangeEndIndex = null;
+        redrawRangeOverlay();
+
+        if (playbackTask != null && loopEnabled) {
+            playhead = playbackStartIndex();
+        }
+    }
+
+    private void clearRangeOverlayOnStop() {
+        clearRangeOverlay();
+    }
+
+    private BukkitTask freezeTimeTask;
+
+    private static void setGameRuleIfPresent(World world, String ruleName, boolean value) {
+        try {
+            world.getClass().getMethod("setGameRule", String.class, String.class)
+                    .invoke(world, ruleName, Boolean.toString(value));
+        } catch (Throwable ignored) {
+        }
     }
 }

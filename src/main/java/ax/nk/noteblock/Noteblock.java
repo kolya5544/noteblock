@@ -19,6 +19,9 @@ public final class Noteblock extends JavaPlugin implements Listener {
         final GameControllerFactory controllerFactory = new TimelineControllerFactory(this);
         this.sessionManager = new SessionManager(this, controllerFactory);
 
+        // Cleanup leftover session worlds from a previous server run/crash.
+        sessionManager.cleanupLeftoverWorldsOnBoot();
+
         getServer().getPluginManager().registerEvents(this, this);
     }
 
@@ -31,6 +34,8 @@ public final class Noteblock extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        // Make sure the player starts the session with a clean inventory.
+        event.getPlayer().getInventory().clear();
         sessionManager.startSession(event.getPlayer());
     }
 

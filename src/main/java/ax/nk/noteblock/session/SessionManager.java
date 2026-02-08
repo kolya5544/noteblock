@@ -103,6 +103,7 @@ public final class SessionManager {
         }
 
         final World world = session.world();
+        final String worldName = world.getName();
 
         final Player player = Bukkit.getPlayer(playerId);
         if (player != null && player.isOnline() && player.getWorld().equals(world)) {
@@ -112,13 +113,40 @@ public final class SessionManager {
             }
         }
 
-        Bukkit.unloadWorld(world, false);
+        // Unload + delete with retries (Windows can hold locks briefly).
+        unloadAndDeleteWorld(worldName, 10);
+    }
 
-        final File worldFolder = world.getWorldFolder();
-        if (worldFolder != null) {
-            final Path path = worldFolder.toPath();
-            WorldDeletion.deleteDirectoryWithRetries(plugin, path, 5);
+    private void unloadAndDeleteWorld(String worldName, int triesLeft) {
+        if (!Bukkit.isPrimaryThread()) {
+            Bukkit.getScheduler().runTask(plugin, () -> unloadAndDeleteWorld(worldName, triesLeft));
+            return;
         }
+
+        final World world = Bukkit.getWorld(worldName);
+        if (world != null) {
+            // Make sure no players are still inside.
+            for (Player p : world.getPlayers()) {
+                final World fallback = Bukkit.getWorlds().isEmpty() ? null : Bukkit.getWorlds().get(0);
+                if (fallback != null) {
+                    p.teleportAsync(fallback.getSpawnLocation());
+                }
+            }
+
+            final boolean unloaded = Bukkit.unloadWorld(world, false);
+            if (!unloaded) {
+                if (triesLeft > 0) {
+                    Bukkit.getScheduler().runTaskLater(plugin, () -> unloadAndDeleteWorld(worldName, triesLeft - 1), 20L);
+                } else {
+                    plugin.getLogger().severe("Failed to unload world '" + worldName + "' for deletion.");
+                }
+                return;
+            }
+        }
+
+        // Delete using the known world container + name (folder can still exist when world is already null).
+        final Path worldPath = Bukkit.getWorldContainer().toPath().resolve(worldName);
+        WorldDeletion.deleteDirectoryWithRetries(plugin, worldPath, 30);
     }
 
     public void shutdown() {
@@ -130,6 +158,32 @@ public final class SessionManager {
         // Avoid ConcurrentModification by iterating over a snapshot.
         for (UUID playerId : sessions.keySet().toArray(UUID[]::new)) {
             endSession(playerId);
+        }
+    }
+
+    /**
+     * Deletes leftover session worlds from previous server runs.
+     * This is intentionally only called on plugin enable ("server reboot" cleanup).
+     */
+    public void cleanupLeftoverWorldsOnBoot() {
+        if (!Bukkit.isPrimaryThread()) {
+            Bukkit.getScheduler().runTask(plugin, this::cleanupLeftoverWorldsOnBoot);
+            return;
+        }
+
+        final File container = Bukkit.getWorldContainer();
+        final File[] children = container.listFiles();
+        if (children == null) return;
+
+        for (File f : children) {
+            if (!f.isDirectory()) continue;
+            final String name = f.getName();
+            if (!name.startsWith(WORLD_PREFIX)) continue;
+
+            // Don't touch loaded worlds.
+            if (Bukkit.getWorld(name) != null) continue;
+
+            WorldDeletion.deleteDirectoryWithRetries(plugin, f.toPath(), 30);
         }
     }
 
