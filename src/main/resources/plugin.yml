@@ -1,0 +1,4 @@
+name: noteblock
+version: '${version}'
+main: ax.nk.noteblock.Noteblock
+api-version: '1.21'
