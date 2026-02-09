@@ -20,13 +20,21 @@ public final class ControlItems {
     public static final String TYPE_INSTRUMENT = "instrument";
     public static final String TYPE_START = "start";
     public static final String TYPE_SETTINGS = "settings";
+    public static final String TYPE_LIBRARY = "library";
     public static final String TYPE_LAYER_TOOL = "layer_tool";
     public static final String TYPE_RANGE_TOOL = "range_tool";
 
+    // Player inventory indices:
+    // - Hotbar: 0..8
+    // - Row above hotbar: 9..17
+    // - Next row: 18..26
+    // - Top row: 27..35
+    public static final int INVENTORY_SLOT_LIBRARY = 35;     // top-right
+    public static final int INVENTORY_SLOT_RANGE_TOOL = 26;  // below library
+    public static final int INVENTORY_SLOT_LAYER_TOOL = 17;  // below range
+
     public static final int INVENTORY_SLOT_START = 8;
     public static final int INVENTORY_SLOT_SETTINGS = 7;
-    public static final int INVENTORY_SLOT_LAYER_TOOL = 6;
-    public static final int INVENTORY_SLOT_RANGE_TOOL = 5;
 
     private final NamespacedKey keyType;
     private final NamespacedKey keyInstrument;
@@ -50,6 +58,10 @@ public final class ControlItems {
 
     public boolean isSettingsItem(ItemStack item) {
         return hasType(item, TYPE_SETTINGS);
+    }
+
+    public boolean isLibraryItem(ItemStack item) {
+        return hasType(item, TYPE_LIBRARY);
     }
 
     public Integer getInstrumentId(ItemStack item) {
@@ -90,6 +102,14 @@ public final class ControlItems {
         settings.setItemMeta(settingsMeta);
         player.getInventory().setItem(INVENTORY_SLOT_SETTINGS, settings);
 
+        final ItemStack library = new ItemStack(Material.BOOK, 1);
+        final ItemMeta libraryMeta = library.getItemMeta();
+        libraryMeta.setDisplayName(ChatColor.GOLD + "Library");
+        libraryMeta.setLore(List.of(ChatColor.GRAY + "Save / load songs"));
+        libraryMeta.getPersistentDataContainer().set(keyType, PersistentDataType.STRING, TYPE_LIBRARY);
+        library.setItemMeta(libraryMeta);
+        player.getInventory().setItem(INVENTORY_SLOT_LIBRARY, library);
+
         final ItemStack start = new ItemStack(Material.BLAZE_ROD, 1);
         final ItemMeta startMeta = start.getItemMeta();
         startMeta.setDisplayName(ChatColor.AQUA + "Start / Stop");
@@ -129,4 +149,3 @@ public final class ControlItems {
         return expected.equals(pdc.get(keyType, PersistentDataType.STRING));
     }
 }
-

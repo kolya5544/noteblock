@@ -5,7 +5,10 @@ import ax.nk.noteblock.game.timeline.edit.TimelineEditor;
 import ax.nk.noteblock.game.timeline.score.TimelineCell;
 import ax.nk.noteblock.game.timeline.score.TimelineScore;
 import ax.nk.noteblock.game.timeline.ui.ControlItems;
+import ax.nk.noteblock.game.timeline.ui.LibraryMenus;
 import ax.nk.noteblock.game.timeline.ui.SettingsMenus;
+import ax.nk.noteblock.game.timeline.ui.SongBrowserMenus;
+import ax.nk.noteblock.game.timeline.ui.DeleteConfirmMenu;
 import org.bukkit.*;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
@@ -55,7 +58,15 @@ public final class TimelineInputHandler implements Listener {
     private final Runnable onCycleLayer;
     private final Runnable onMaybeRemoveCurrentLayerOrAdd;
 
+    private final Supplier<SongBrowserMenus.Callbacks> songBrowserCallbacks;
+
     private final Supplier<SettingsMenus.Callbacks> settingsCallbacks;
+    private final Supplier<LibraryMenus.Callbacks> libraryCallbacks;
+    private final LibraryMenus libraryMenus;
+    private final SongBrowserMenus songBrowserMenus;
+    private final DeleteConfirmMenu deleteConfirmMenu;
+
+    private final Supplier<DeleteConfirmMenu.Callbacks> deleteConfirmCallbacks;
 
     private final Supplier<Boolean> debugInput;
 
@@ -78,9 +89,16 @@ public final class TimelineInputHandler implements Listener {
                                Runnable onCycleLayer,
                                Runnable onMaybeRemoveCurrentLayerOrAdd,
                                Supplier<SettingsMenus.Callbacks> settingsCallbacks,
+                               Supplier<LibraryMenus.Callbacks> libraryCallbacks,
+                               LibraryMenus libraryMenus,
+                               Supplier<SongBrowserMenus.Callbacks> songBrowserCallbacks,
+                               SongBrowserMenus songBrowserMenus,
+                               Supplier<DeleteConfirmMenu.Callbacks> deleteConfirmCallbacks,
+                               DeleteConfirmMenu deleteConfirmMenu,
                                Supplier<Boolean> debugInput) {
         this.controlItems = Objects.requireNonNull(controlItems);
         this.settingsMenus = Objects.requireNonNull(settingsMenus);
+        this.libraryMenus = Objects.requireNonNull(libraryMenus);
         this.editor = Objects.requireNonNull(editor);
         this.score = Objects.requireNonNull(score);
         this.targeting = Objects.requireNonNull(targeting);
@@ -96,6 +114,11 @@ public final class TimelineInputHandler implements Listener {
         this.onCycleLayer = Objects.requireNonNull(onCycleLayer);
         this.onMaybeRemoveCurrentLayerOrAdd = Objects.requireNonNull(onMaybeRemoveCurrentLayerOrAdd);
         this.settingsCallbacks = Objects.requireNonNull(settingsCallbacks);
+        this.libraryCallbacks = Objects.requireNonNull(libraryCallbacks);
+        this.songBrowserCallbacks = Objects.requireNonNull(songBrowserCallbacks);
+        this.songBrowserMenus = Objects.requireNonNull(songBrowserMenus);
+        this.deleteConfirmCallbacks = Objects.requireNonNull(deleteConfirmCallbacks);
+        this.deleteConfirmMenu = Objects.requireNonNull(deleteConfirmMenu);
         this.debugInput = Objects.requireNonNull(debugInput);
     }
 
@@ -177,10 +200,29 @@ public final class TimelineInputHandler implements Listener {
             return;
         }
 
+        if (libraryMenus.isAnyMenuView(event.getView())) {
+            event.setCancelled(true);
+            libraryMenus.handleClick(p, event.getView(), event.getRawSlot(), libraryCallbacks.get());
+            return;
+        }
+
+        if (songBrowserMenus.isView(event.getView())) {
+            event.setCancelled(true);
+            songBrowserMenus.handleClick(p, event.getView(), event.getRawSlot(), songBrowserCallbacks.get());
+            return;
+        }
+
+        if (deleteConfirmMenu.isView(event.getView())) {
+            event.setCancelled(true);
+            deleteConfirmMenu.handleClick(event.getView(), event.getRawSlot(), deleteConfirmCallbacks.get());
+            return;
+        }
+
         final ItemStack current = event.getCurrentItem();
         final ItemStack cursor = event.getCursor();
         if (!controlItems.isStartItem(current) && !controlItems.isStartItem(cursor)
-                && !controlItems.isSettingsItem(current) && !controlItems.isSettingsItem(cursor)) {
+                && !controlItems.isSettingsItem(current) && !controlItems.isSettingsItem(cursor)
+                && !controlItems.isLibraryItem(current) && !controlItems.isLibraryItem(cursor)) {
             return;
         }
 
@@ -262,6 +304,12 @@ public final class TimelineInputHandler implements Listener {
         if (controlItems.isSettingsItem(item)) {
             event.setCancelled(true);
             settingsMenus.openMain(sp, settingsCallbacks.get());
+            return;
+        }
+
+        if (controlItems.isLibraryItem(item)) {
+            event.setCancelled(true);
+            libraryMenus.openMain(sp, libraryCallbacks.get());
             return;
         }
 
