@@ -10,6 +10,7 @@ import ax.nk.noteblock.game.timeline.ui.LibraryMenus;
 import ax.nk.noteblock.game.timeline.ui.SettingsMenus;
 import ax.nk.noteblock.game.timeline.ui.ChatPrompt;
 import ax.nk.noteblock.game.timeline.ui.TextPrompt;
+import ax.nk.noteblock.game.timeline.ui.PitchName;
 import ax.nk.noteblock.game.timeline.util.TimelineMath;
 import ax.nk.noteblock.game.timeline.world.FreezeTimeService;
 import ax.nk.noteblock.game.timeline.world.WorldRules;
@@ -25,6 +26,7 @@ import ax.nk.noteblock.persistence.SongDataRow;
 import ax.nk.noteblock.persistence.SongRow;
 import com.google.gson.Gson;
 import org.bukkit.*;
+import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
 import org.bukkit.event.HandlerList;
 import org.bukkit.event.Listener;
@@ -122,6 +124,16 @@ public final class TimelineController implements GameController, Listener {
     private final ChatPrompt chatPrompt;
     private final TextPrompt textPrompt;
 
+    private int previousXpLevel;
+    private float previousXpProgress;
+    private boolean xpOverlaid;
+
+    private Integer lastHoverPitch;
+    private Integer lastHoverTime;
+    private Integer lastHoverInstrument;
+
+    private int hoverTaskId = -1;
+
     public TimelineController(Plugin plugin, SongRepository songRepository, ChatPrompt chatPrompt, TextPrompt textPrompt) {
         this.plugin = plugin;
         this.controlItems = new ControlItems(plugin);
@@ -137,6 +149,15 @@ public final class TimelineController implements GameController, Listener {
     public void onStart(GameSession session, Player player) {
         this.session = session;
         this.player = player;
+
+        // Save XP state so we can show pitch as level.
+        previousXpLevel = player.getLevel();
+        previousXpProgress = player.getExp();
+        xpOverlaid = false;
+
+        lastHoverPitch = null;
+        lastHoverTime = null;
+        lastHoverInstrument = null;
 
         // Register input handler (all listeners live there now)
         inputHandler = new TimelineInputHandler(
@@ -228,6 +249,8 @@ public final class TimelineController implements GameController, Listener {
         loadMode = SongBrowserMenus.Mode.LOAD;
 
         score.clear();
+
+        startHoverHud();
     }
 
     @Override
@@ -246,6 +269,7 @@ public final class TimelineController implements GameController, Listener {
         HandlerList.unregisterAll(this);
         score.clear();
         freezeTimeService.stop();
+        stopHoverHud();
     }
 
     // --- Playback
@@ -845,5 +869,93 @@ public final class TimelineController implements GameController, Listener {
                 openLoadSongBrowser(loadPageIndex, loadMode);
             }
         };
+    }
+
+    private void startHoverHud() {
+        stopHoverHud();
+        hoverTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, this::tickHoverHud, 1L, 2L);
+    }
+
+    private void stopHoverHud() {
+        if (hoverTaskId != -1) {
+            Bukkit.getScheduler().cancelTask(hoverTaskId);
+            hoverTaskId = -1;
+        }
+        restoreXpHud();
+    }
+
+    private void restoreXpHud() {
+        if (player == null) return;
+        if (!xpOverlaid) return;
+        xpOverlaid = false;
+        player.setLevel(previousXpLevel);
+        player.setExp(previousXpProgress);
+    }
+
+    private void tickHoverHud() {
+        if (player == null || session == null) return;
+        final World w = session.world();
+        if (w == null || !w.equals(player.getWorld())) {
+            restoreXpHud();
+            return;
+        }
+
+        final Block b = targeting.raycastTrackCellBlock(player, w, trackLength, layerY(activeLayerIndex));
+        if (b == null) {
+            if (lastHoverPitch != null) {
+                lastHoverPitch = null;
+                lastHoverTime = null;
+                lastHoverInstrument = null;
+                player.sendActionBar("");
+                restoreXpHud();
+            }
+            return;
+        }
+
+        final ax.nk.noteblock.game.timeline.score.TimelineCell cell = editor.toCell(b.getLocation(), trackLength);
+        if (cell == null) {
+            return;
+        }
+
+        final int pitchRow = cell.pitch();
+        final int timeIndex = cell.timeIndex();
+
+        Integer instrumentId = null;
+        final BlockPos pos = new BlockPos(b.getX(), b.getY(), b.getZ());
+        final TimelineScore.NoteRef ref = score.refByPosView().get(pos);
+        if (ref != null) {
+            final int layer = TimelineScore.clampLayerIndex(ref.layerIndex(), LAYER_COUNT);
+            final List<NoteEvent> list = score.scoreByLayerView().get(layer).get(ref.tickIndex());
+            if (list != null) {
+                for (NoteEvent n : list) {
+                    if (n != null && n.pos().equals(pos)) {
+                        instrumentId = n.instrumentId();
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (Objects.equals(lastHoverPitch, pitchRow)
+                && Objects.equals(lastHoverTime, timeIndex)
+                && Objects.equals(lastHoverInstrument, instrumentId)) {
+            return; // no HUD change
+        }
+
+        lastHoverPitch = pitchRow;
+        lastHoverTime = timeIndex;
+        lastHoverInstrument = instrumentId;
+
+        final String pitchName = PitchName.nameForRow(pitchRow);
+        final String instrumentName = instrumentId == null
+                ? (ChatColor.DARK_GRAY + "(empty)")
+                : (ChatColor.GRAY + "• " + ChatColor.WHITE + ChatColor.stripColor(InstrumentPalette.byId(instrumentId).displayName));
+
+        player.sendActionBar(ChatColor.AQUA + pitchName + ChatColor.DARK_GRAY + "  @" + ChatColor.GRAY + timeIndex + " " + instrumentName);
+
+        // XP overlay: show pitch row as level (0..24). Keep progress stable.
+        if (!xpOverlaid) xpOverlaid = true;
+        player.setLevel(pitchRow);
+        player.setExp(previousXpProgress);
     }
 }
